@@ -1,0 +1,7 @@
+pdfplumber
+faiss-cpu
+sentence-transformers
+rapidfuzz
+streamlit
+openai
+peft
