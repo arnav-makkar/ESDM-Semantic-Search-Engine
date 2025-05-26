@@ -7,18 +7,15 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
 import spacy
-import streamlit as st
-import datetime
-import pytz
-from pathlib import Path
 
-# Initialize spaCy model
+# Note: This script requires spaCy and the 'en_core_web_sm' model.
+# Install spaCy: pip install spacy
+# Download the model: python -m spacy download en_core_web_sm
+
+# Load spaCy model
 nlp = spacy.load("en_core_web_sm")
 
-# Initialize SentenceTransformer model
-model = SentenceTransformer("BAAI/bge-base-en")
-
-# Cache setup
+# --- Cache Setup ---
 CACHE_DIR = "pdf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_INFO_FILE = os.path.join(CACHE_DIR, "cache_info.json")
@@ -26,8 +23,6 @@ EMBEDDINGS_FILE = os.path.join(CACHE_DIR, "embeddings.npy")
 CHUNKS_FILE = os.path.join(CACHE_DIR, "chunks.json")
 METADATA_FILE = os.path.join(CACHE_DIR, "metadata.json")
 FILE_TO_COMPANY_FILE = os.path.join(CACHE_DIR, "file_to_company.json")
-PDF_FOLDER = "solar_pdfs"
-os.makedirs(PDF_FOLDER, exist_ok=True)
 
 def get_pdf_folder_hash(pdf_folder):
     """Generates a hash based on PDF filenames and their modification times."""
@@ -59,7 +54,7 @@ def load_cache(pdf_folder):
         embeddings = np.load(EMBEDDINGS_FILE)
         return document_chunks, metadata, file_to_company, embeddings
     except Exception as e:
-        st.error(f"Error loading cache: {e}")
+        print(f"Error loading cache: {e}")
         return None
 
 def save_cache(pdf_folder, document_chunks, metadata, file_to_company, embeddings):
@@ -75,6 +70,7 @@ def save_cache(pdf_folder, document_chunks, metadata, file_to_company, embedding
         json.dump(file_to_company, f)
     np.save(EMBEDDINGS_FILE, embeddings)
 
+# --- Step 1: PDF Text Extraction ---
 def extract_text_from_pdf(pdf_path):
     """Extracts all text from a PDF file."""
     text = ""
@@ -85,6 +81,7 @@ def extract_text_from_pdf(pdf_path):
                 text += page_text + "\n"
     return text
 
+# --- Step 2: Text Chunking ---
 def chunk_text(text, chunk_size=500, overlap=50):
     """Splits the text into overlapping chunks of 'chunk_size' words with 'overlap'."""
     words = text.split()
@@ -94,11 +91,15 @@ def chunk_text(text, chunk_size=500, overlap=50):
         chunks.append(chunk)
     return chunks
 
+# --- Step 3: Embedding Generation with bge-base-en ---
+model = SentenceTransformer("BAAI/bge-base-en")
+
 def embed_texts(texts):
     """Converts a list of texts to embeddings, ensuring they are float32 for FAISS."""
     embeddings = model.encode(texts, convert_to_tensor=False)
     return np.array(embeddings).astype("float32")
 
+# --- Step 4: Create FAISS Index ---
 def create_faiss_index(embeddings):
     """Creates and returns a FAISS Index using L2 distance."""
     dimension = embeddings.shape[1]
@@ -106,6 +107,7 @@ def create_faiss_index(embeddings):
     index.add(embeddings)
     return index
 
+# --- Helper: Extract Solar Panel Company Name with spaCy ---
 def extract_company_name(text):
     """Extracts the solar panel company name using spaCy's NER for context-aware identification."""
     doc = nlp(text)
@@ -128,88 +130,77 @@ def extract_company_name(text):
     
     return "Unknown"
 
-def process_pdfs(pdf_folder, uploaded_files=None):
-    """Processes PDFs from folder or uploaded files, using cache if available."""
-    # Handle uploaded files
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            with open(os.path.join(pdf_folder, uploaded_file.name), "wb") as f:
-                f.write(uploaded_file.getbuffer())
-    
-    # Check for valid cache
-    cached_data = load_cache(pdf_folder)
-    if cached_data:
-        st.info("Loading data from cache...")
-        return cached_data
-    
-    st.info("No valid cache found, processing PDFs...")
-    document_chunks = []
-    metadata = []
-    file_to_company = {}
+# --- Step 5: Ingest PDFs and Prepare Data ---
+pdf_folder = "solar_pdfs"  # Folder containing your 10 solar panel PDF files.
+
+# Check for valid cache
+cached_data = load_cache(pdf_folder)
+if cached_data:
+    print("Loading data from cache...")
+    document_chunks, metadata, file_to_company, embeddings = cached_data
+else:
+    print("No valid cache found, processing PDFs...")
+    document_chunks = []       # List for storing text chunks of all PDFs.
+    metadata = []              # List for storing metadata for each chunk.
+    file_to_company = {}       # Dictionary mapping filename -> company name
 
     for filename in os.listdir(pdf_folder):
         if filename.lower().endswith(".pdf"):
             pdf_path = os.path.join(pdf_folder, filename)
-            st.write(f"Processing: {filename}")
+            print("Processing:", filename)
+            # Extract all text from the PDF.
             text = extract_text_from_pdf(pdf_path)
+            # Extract company name using spaCy
             company = extract_company_name(text)
             file_to_company[filename] = company
+            # Chunk the text.
             chunks = chunk_text(text)
             document_chunks.extend(chunks)
+            # For each chunk, store metadata (filename in this case).
             metadata.extend([{"source": filename}] * len(chunks))
 
+    # Generate embeddings and save to cache
     embeddings = embed_texts(document_chunks)
     save_cache(pdf_folder, document_chunks, metadata, file_to_company, embeddings)
-    return document_chunks, metadata, file_to_company, embeddings
 
+# --- Step 6: Build FAISS Index ---
+index = create_faiss_index(embeddings)
+print("FAISS index built with", index.ntotal, "chunks.")
+
+# --- Step 7: Aggregated PDF Ranking Search Function ---
 def search_pdfs(query, index, document_chunks, metadata):
-    """Searches for the query across all chunks and returns ranked results."""
+    """Searches for the query across all chunks, aggregates the results by PDF file,
+    and returns a sorted ranking (best match first) based on the lowest distance score."""
+    # Retrieve all chunks (dataset is small, so we use len(document_chunks) as top_k)
     top_k = len(document_chunks)
     query_embedding = embed_texts([query])
     distances, indices = index.search(query_embedding, top_k)
     
+    # Group results by source file and record the best (lowest) distance for each.
     results_by_pdf = {}
     for dist, idx in zip(distances[0], indices[0]):
         pdf_source = metadata[idx]["source"]
+        # Update if this PDF hasn't been seen or if this chunk has a better score.
         if pdf_source not in results_by_pdf or dist < results_by_pdf[pdf_source]["distance"]:
             results_by_pdf[pdf_source] = {"distance": dist, "snippet": document_chunks[idx]}
     
+    # Sort the aggregated results by distance (lower is better).
     sorted_results = sorted(results_by_pdf.items(), key=lambda item: item[1]["distance"])
     return sorted_results
 
-# Streamlit app
-def main():
-    st.title("Solar Panel PDF Search")
-
-    # File uploader
-    uploaded_files = st.file_uploader("Upload PDF files (optional)", type="pdf", accept_multiple_files=True)
-    
-    # Process PDFs
-    with st.spinner("Processing PDFs..."):
-        document_chunks, metadata, file_to_company, embeddings = process_pdfs(PDF_FOLDER, uploaded_files)
-        index = create_faiss_index(embeddings)
-        st.success(f"FAISS index built with {index.ntotal} chunks.")
-
-    # Query input
-    query = st.text_input("Enter your search query", value="Efficiency ratings and temperature coefficients for rooftop solar panels")
-    
-    # Search button
-    if st.button("Search"):
-        if query:
-            with st.spinner("Searching..."):
-                results = search_pdfs(query, index, document_chunks, metadata)
-                
-                st.subheader("Search Results")
-                for rank, (pdf_source, data) in enumerate(results, 1):
-                    company = file_to_company.get(pdf_source, "Unknown")
-                    st.markdown(f"**Rank {rank}**")
-                    st.write(f"**Source File**: {pdf_source}")
-                    st.write(f"**Company**: {company}")
-                    st.write(f"**Best Distance Score**: {data['distance']:.4f}")
-                    st.write(f"**Snippet**: {data['snippet'][:500]}...")
-                    st.markdown("---")
-        else:
-            st.warning("Please enter a search query.")
-
+# --- Example Query Execution ---
 if __name__ == "__main__":
-    main()
+    query = "Efficiency ratings and temperature coefficients for rooftop solar panels"
+    aggregated_results = search_pdfs(query, index, document_chunks, metadata)
+    
+    print("\n--- PDF Ranking Results ---")
+    rank = 1
+    for pdf_source, data in aggregated_results:
+        company = file_to_company.get(pdf_source, "Unknown")
+        print(f"Rank {rank}:")
+        print("Source File:", pdf_source)
+        print("Company:", company)
+        print("Best Distance Score:", data["distance"])
+        print("Snippet:", data["snippet"][:200])
+        print("=" * 50)
+        rank += 1
